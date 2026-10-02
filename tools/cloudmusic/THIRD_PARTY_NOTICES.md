@@ -21,4 +21,11 @@
 - 许可证：[上游 GPL-3.0](https://github.com/BetterNCM/Plugin-Market/blob/3ad8be7d6e21d87fc8c9e6858a297c0ede5a62f0/LICENSE)。
 - 发行文件：`packages/PluginMarket.plugin`。该文件不是上游原包，修改范围见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
-依赖包继续遵循各自的许可证。网易云音乐客户端、账号数据和第三方歌词/主题插件均不在本目录中分发。
+依赖包继续遵循各自的许可证。网易云音乐客户端和账号数据不在本目录中分发。
+
+## RefinedNowPlayingNext 汉字注音可选包
+
+`packages/RefinedNowPlayingNext-3.0.2+romaji.1.plugin` 是单独安装的 RNP 改版。
+源码版本、补丁和构建方法见 [refined-romaji/README.md](refined-romaji/README.md)。
+包内 `licenses/` 保留 RefinedNowPlayingNext、jp-furigana、kuromoji、IPADIC 和 WanaKana 的完整许可声明。
+本目录工具的许可证不取代这些第三方条款。

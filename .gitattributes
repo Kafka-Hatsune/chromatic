@@ -1,2 +1,3 @@
 # Unified diff context lines intentionally contain a leading space before tabs.
 tools/cloudmusic/*.patch -whitespace
+tools/cloudmusic/refined-romaji/*.patch text eol=lf -whitespace

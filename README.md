@@ -7,6 +7,7 @@
 - [安装、使用、卸载和故障恢复说明](tools/cloudmusic/README.md)
 - [已验证环境、测试范围和兼容性](tools/cloudmusic/VALIDATION.md)
 - [修复内容、源码来源与构建方法](tools/cloudmusic/DEVELOPMENT.md)
+- [可选：RefinedNowPlayingNext 汉字上方罗马音](tools/cloudmusic/refined-romaji/README.md)——缺少歌曲读音时本地补全，双击 `Install-Romaji.cmd` 安装。
 
 ## 已验证环境
 
@@ -38,6 +39,7 @@
 - 插件商店默认连接官方 GitHub 插件库，移除对旧远程源列表的依赖。
 - 修复无效源名称导致的异常，以及插件下载 HTTP 错误仍被保存的问题。
 - 提供路径检测、未知加载器保护、安装回滚和指定插件禁用工具。
+- 可选安装 RNP 汉字上方罗马音改版，包含本地词典、源码补丁和独立回退工具。
 
 本仓库没有重编译或修改 BetterNCM 核心 DLL，也没有修复所有第三方插件。RefinedNowPlayingNext 的一次卡住问题在完整重启后恢复，但没有确认根因，不能据此承诺已解决长期卡死。
 

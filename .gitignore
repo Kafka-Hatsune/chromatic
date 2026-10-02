@@ -8,3 +8,5 @@ output.log
 /test
 .local-install/
 tools/cloudmusic/backups/
+tools/cloudmusic/refined-romaji/.build/
+tools/cloudmusic/refined-romaji/*.log

@@ -1,0 +1,799 @@
+diff --git a/THIRD-PARTY-NOTICES.md b/THIRD-PARTY-NOTICES.md
+new file mode 100644
+index 0000000..f529d50
+--- /dev/null
++++ b/THIRD-PARTY-NOTICES.md
+@@ -0,0 +1,21 @@
++# Japanese kanji reading integration
++
++The local `3.0.2+romaji.1` build extends RefinedNowPlayingNext (MIT), based on
++https://github.com/SUlTlUS/refined-now-playing-netease-next at
++167bffe62b57bd276fc6aa34237c4a197f56fa7d. Its upstream identity/settings are retained.
++
++- Reading alignment and the patched kuromoji browser bundle are vendored unchanged
++  from https://github.com/Leleawa/jp-furigana at
++  b536d24b67a625dd4fc01a899e92da69a40cfb1f. Alignment code: MIT, copyright 2026 leleawa.
++  See `vendor/japanese/LICENSE`, `NOTICE.md` and `patch-kuromoji.js`.
++- kuromoji.js 0.1.2: Apache-2.0, copyright Takuya Asano and contributors.
++  The modified dictionary-loader hook is used to transfer local files to a Worker.
++  The complete license is in `vendor/japanese/LICENSE-kuromoji.txt`.
++- IPADIC binary dictionaries: the complete NAIST/ICOT copyright and disclaimer
++  are retained in `vendor/japanese/NOTICE.md` and in the distributed plugin.
++- WanaKana 5.3.1: MIT, https://github.com/WaniKani/WanaKana.
++  Its license is copied from the pinned npm dependency into the plugin.
++
++The integration adds a local Worker, bounds its cache, and renders annotations
++through React. It does not install or run jp-furigana's DOM observer plugin.
++No lyric text is sent to a third-party reading service.
+diff --git a/package.json b/package.json
+index 5c92d22..1aada17 100644
+--- a/package.json
++++ b/package.json
+@@ -5,6 +5,7 @@
+     "@babel/plugin-syntax-dynamic-import": "^7.8.3",
+     "@babel/preset-env": "^7.20.2",
+     "@babel/preset-react": "^7.18.6",
++    "@types/node": "18.19.39",
+     "@webpack-cli/generators": "^3.0.1",
+     "babel-loader": "^9.1.0",
+     "copy-webpack-plugin": "^11.0.0",
+@@ -15,6 +16,7 @@
+     "sass": "^1.52.3",
+     "sass-loader": "^13.0.0",
+     "style-loader": "^3.3.1",
++    "terser-webpack-plugin": "5.6.1",
+     "ts-loader": "^9.4.2",
+     "typescript": "^4.9.5",
+     "webpack": "^5.75.0",
+@@ -26,6 +28,7 @@
+   "description": "RefinedNowPlaying",
+   "name": "refined-now-playing",
+   "scripts": {
++    "test:kanji": "node --test --test-timeout=30000 tools/test-kanji.cjs",
+     "build": "webpack --mode=production --node-env=production",
+     "build:dev": "webpack --mode=development",
+     "build:prod": "webpack --mode=production --node-env=production",
+@@ -42,7 +45,8 @@
+     "fast-average-color": "^9.3.0",
+     "lodash": "^4.17.21",
+     "path-browserify": "^1.0.1",
+-    "react": "^18.2.0",
+-    "react-dom": "^18.2.0"
++    "react": "18.2.0",
++    "react-dom": "18.2.0",
++    "wanakana": "5.3.1"
+   }
+ }
+diff --git a/src/kanji-engine.cjs b/src/kanji-engine.cjs
+new file mode 100644
+index 0000000..3e97895
+--- /dev/null
++++ b/src/kanji-engine.cjs
+@@ -0,0 +1,21 @@
++const core = require('../vendor/japanese/furigana.js');
++const { toRomaji } = require('wanakana');
++const { hasKanji, onlyKanji } = require('./kanji-model.cjs');
++
++function analyzeText(tokenizer, text, roman = '') {
++    if (!hasKanji(text) || core.isCreditLine(text) || text.length > 1000) return [{ text }];
++    const dictionary = core.tokensToSegments(tokenizer.tokenize(text));
++    if (dictionary.map(segment => segment.text).join('') !== text) return [{ text }];
++    const kana = roman && core.romajiToKana(roman);
++    const supplied = kana && core.segmentsFromReading(text, kana, dictionary);
++    const segments = supplied || dictionary;
++    return segments.map(segment => {
++        // Do not spread a whole-word reading over kana or numbers on failed alignment.
++        // Keep author-supplied parenthetical text; only annotation is added.
++        if (!segment.rt || !onlyKanji(segment.text)) return { text: segment.text };
++        const romaji = toRomaji(segment.rt);
++        if (!/^[a-z' -]+$/i.test(romaji)) return { text: segment.text };
++        return { text: segment.text, hiragana: core.toHiragana(segment.rt), romaji, source: segment.fixed ? 'inline' : supplied ? 'lyric' : 'dictionary' };
++    });
++}
++module.exports = { analyzeText };
+diff --git a/src/kanji-host.html b/src/kanji-host.html
+new file mode 100644
+index 0000000..9ad1769
+--- /dev/null
++++ b/src/kanji-host.html
+@@ -0,0 +1,5 @@
++<!doctype html>
++<meta charset="utf-8">
++<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'">
++<title>RNP local reading worker</title>
++<script src="kanji-host.js"></script>
+diff --git a/src/kanji-host.js b/src/kanji-host.js
+new file mode 100644
+index 0000000..5bbd9f4
+--- /dev/null
++++ b/src/kanji-host.js
+@@ -0,0 +1,16 @@
++// An isolated local origin avoids changing the host application's CSP.
++// Accept one private MessagePort from the embedding CloudMusic window.
++let connected = false;
++window.addEventListener('message', event => {
++    if (connected || event.source !== parent || event.data?.type !== 'rnp-kanji-connect' || !event.ports[0]) return;
++    connected = true;
++    const port = event.ports[0];
++    try {
++        const worker = new Worker('kanji-worker.js');
++        worker.onmessage = ({ data }) => port.postMessage(data);
++        worker.onerror = event => port.postMessage({ type: 'error', error: event.message });
++        port.onmessage = ({ data }) => worker.postMessage(data, data.buffer ? [data.buffer] : []);
++        window.addEventListener('unload', () => worker.terminate());
++        port.postMessage({ type: 'ready' });
++    } catch (error) { port.postMessage({ type: 'error', error: String(error.message || error) }); }
++});
+diff --git a/src/kanji-model.cjs b/src/kanji-model.cjs
+new file mode 100644
+index 0000000..160659a
+--- /dev/null
++++ b/src/kanji-model.cjs
+@@ -0,0 +1,52 @@
++// Shared by the renderer, worker and tests. Never change the lyric's source text.
++const hasKana = text => /[ぁ-ゖァ-ヺ]/.test(text);
++const hasKanji = text => /[々〇一-鿿㐀-䶿豈-﫿]/.test(text);
++const onlyKanji = text => /^[々〇一-鿿㐀-䶿豈-﫿]+$/.test(text);
++const isCredit = text => /^(作词|作曲|编曲|作詞|作曲|編曲|歌手|制作|製作|混音|录音|演唱|词|曲|Lyric|Music|Vocal|Arrange|Compose|Produce|Mix|Master)\s*[:：/]/i.test(text.trim());
++
++function readingRequests(lines) {
++    // Kana is evidence for Japanese; Chinese songs must not get Japanese readings.
++    const content = lines.filter(line => line.originalLyric && !isCredit(line.originalLyric));
++    const kanaLines = content.filter(line => hasKana(line.originalLyric)).length;
++    const japaneseSong = kanaLines >= 2 && kanaLines >= content.length * 0.35;
++    return lines.map(line => {
++        const text = line.originalLyric || '';
++        const eligible = !isCredit(text) && (hasKana(text) || (japaneseSong && hasKanji(text)));
++        return eligible ? { text, karaoke: line.dynamicLyric?.map(word => word.word).join('') || text, roman: line.romanLyric || '' } : null;
++    });
++}
++
++function hasReadings(line) {
++    return !!line.kanjiReading?.original?.some(segment => segment.romaji);
++}
++
++function useKanjiReading(line, mode, showRomaji) {
++    return showRomaji && mode !== 'off' && !!line.kanjiReading;
++}
++
++// A compound can cover multiple timed words (世 + 界). Keep its reading together
++// and retain each word's original index/timing inside the compound.
++function karaokeGroups(words, segments) {
++    const text = words.map(word => word.word).join('');
++    if (!segments || segments.map(segment => segment.text).join('') !== text) {
++        return words.map((word, index) => ({ parts: [{ text: word.word, index, final: true }] }));
++    }
++    const groups = [];
++    let wordIndex = 0, wordOffset = 0;
++    for (const segment of segments) {
++        const parts = [];
++        let offset = 0;
++        while (offset < segment.text.length && wordIndex < words.length) {
++            const word = words[wordIndex].word;
++            const length = Math.min(segment.text.length - offset, word.length - wordOffset);
++            if (length > 0) parts.push({ text: segment.text.slice(offset, offset + length), index: wordIndex, final: wordOffset + length === word.length });
++            offset += length;
++            wordOffset += length;
++            if (wordOffset === word.length) { wordIndex++; wordOffset = 0; }
++        }
++        groups.push({ ...segment, parts });
++    }
++    return groups;
++}
++
++module.exports = { hasKana, hasKanji, onlyKanji, readingRequests, hasReadings, useKanjiReading, karaokeGroups };
+diff --git a/src/kanji-reader.js b/src/kanji-reader.js
+new file mode 100644
+index 0000000..122160e
+--- /dev/null
++++ b/src/kanji-reader.js
+@@ -0,0 +1,102 @@
++import { readingRequests } from './kanji-model.cjs';
++
++const dictionaryFiles = new Set(['base', 'check', 'cc', 'tid', 'tid_pos', 'tid_map', 'unk', 'unk_pos', 'unk_map', 'unk_char', 'unk_compat', 'unk_invoke'].map(name => `${name}.dat.gz`));
++let worker, boot, sequence = 0, generation = 0, retryAfter = 0;
++const pending = new Map();
++
++export function cancelKanjiReadings() {
++    for (const request of pending.values()) {
++        clearTimeout(request.timer);
++        request.resolve(null);
++    }
++    pending.clear();
++}
++
++export function disposeKanjiReader() {
++    generation++;
++    cancelKanjiReadings();
++    worker?.terminate();
++    worker = null;
++    boot = null;
++}
++
++function fail(error) {
++    console.warn('[RNP kanji] Reading engine unavailable; original lyrics remain available.', error);
++    disposeKanjiReader();
++    retryAfter = Date.now() + 60000;
++}
++
++async function ensureWorker() {
++    if (Date.now() < retryAfter) return null;
++    if (worker) return worker;
++    if (boot) return boot;
++    const epoch = generation;
++    boot = (async () => {
++        const root = plugin.pluginPath;
++        // CloudMusic 3.1.41's CSP disallows blob Workers in the orpheus page.
++        // A same-origin local Worker in a hidden mounted page needs no CSP changes.
++        const mounted = await betterncm.fs.mountDir(root);
++        if (epoch !== generation) return null;
++        const frame = document.createElement('iframe');
++        frame.hidden = true;
++        frame.title = 'RNP local Japanese reading worker';
++        frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
++        const channel = new MessageChannel();
++        const instance = {
++            postMessage: (data, transfer = []) => channel.port1.postMessage(data, transfer),
++            terminate: () => { channel.port1.close(); frame.remove(); },
++        };
++        worker = instance;
++        let markReady;
++        const ready = new Promise(resolve => { markReady = resolve; });
++        channel.port1.onmessage = async ({ data }) => {
++            if (worker !== instance) return;
++            if (data.type === 'ready') { markReady(instance); return; }
++            if (data.type === 'error') { fail(data.error); markReady(null); return; }
++            if (data.type === 'dictionary') {
++                try {
++                    if (!dictionaryFiles.has(data.name)) throw new Error('Unknown dictionary file');
++                    const blob = await betterncm.fs.readFile(`${root}/dict/${data.name}`);
++                    const buffer = await blob.arrayBuffer();
++                    if (worker === instance) instance.postMessage({ type: 'dictionary', id: data.id, buffer }, [buffer]);
++                } catch (error) {
++                    if (worker === instance) instance.postMessage({ type: 'dictionary', id: data.id, error: String(error.message || error) });
++                }
++                return;
++            }
++            if (data.type !== 'result') return;
++            const request = pending.get(data.id);
++            if (!request) return;
++            if (data.error) { fail(data.error); return; }
++            pending.delete(data.id);
++            clearTimeout(request.timer);
++            request.resolve(data.result);
++        };
++        frame.onload = () => {
++            if (worker === instance) frame.contentWindow.postMessage({ type: 'rnp-kanji-connect' }, new URL(mounted).origin, [channel.port2]);
++        };
++        frame.onerror = () => { if (worker === instance) fail('Reading worker host failed to load'); markReady(null); };
++        frame.src = `${mounted}/kanji-host.html`;
++        document.body.appendChild(frame);
++        return ready;
++    })().catch(error => { fail(error); return null; });
++    return boot;
++}
++
++export async function addKanjiReadings(lines) {
++    const requests = readingRequests(lines);
++    if (!requests.some(Boolean)) return null;
++    // Include bootstrap/file reads in the timeout, and discard outdated song jobs.
++    cancelKanjiReadings();
++    const id = ++sequence;
++    return new Promise(resolve => {
++        const timer = setTimeout(() => fail('Reading engine timed out'), 30000);
++        pending.set(id, { resolve: result => resolve(result && lines.map((line, index) => result[index] ? { ...line, kanjiReading: result[index] } : line)), timer });
++        ensureWorker().then(instance => {
++            if (!pending.has(id)) return;
++            if (!instance) { cancelKanjiReadings(); return; }
++            instance.postMessage({ type: 'analyze', id, lines: requests });
++        }).catch(error => { if (pending.has(id)) fail(error); });
++    });
++}
++window.addEventListener('beforeunload', disposeKanjiReader);
+diff --git a/src/kanji-ruby.js b/src/kanji-ruby.js
+new file mode 100644
+index 0000000..ac8b258
+--- /dev/null
++++ b/src/kanji-ruby.js
+@@ -0,0 +1,24 @@
++import { karaokeGroups } from './kanji-model.cjs';
++
++function Ruby({ segment, mode, children }) {
++    const reading = mode === 'hiragana' ? segment.hiragana : segment.romaji;
++    return reading ? <ruby className="rnp-kanji-ruby"><span className="rnp-kanji-base">{children}</span><rt>{reading}</rt></ruby> : <React.Fragment>{children}</React.Fragment>;
++}
++
++export function KanjiText({ text, segments, mode }) {
++    if (!segments || mode === 'off') return text;
++    return segments.map((segment, index) => <Ruby key={index} segment={segment} mode={mode}>{segment.text}</Ruby>);
++}
++
++export function KanjiKaraoke({ words, segments, mode, animation, wordStyle, fillerStyle }) {
++    const groups = React.useMemo(() => karaokeGroups(words, mode === 'off' ? null : segments), [words, segments, mode]);
++    return groups.map((group, groupIndex) => <Ruby key={groupIndex} segment={group} mode={mode}>{group.parts.map(part => {
++        const word = words[part.index];
++        return <span key={`${part.index}-${part.final}`} data-word-index={part.index}
++            className={`rnp-karaoke-word ${word.isCJK ? 'is-cjk' : ''} ${word.endsWithSpace && part.final ? 'end-with-space' : ''}`}
++            style={wordStyle(word)}>
++            <span>{part.text}</span>
++            {animation === 'slide' && <span className="rnp-karaoke-word-filler" style={fillerStyle(word)}>{part.text}</span>}
++        </span>;
++    })}</Ruby>);
++}
+diff --git a/src/kanji-worker.js b/src/kanji-worker.js
+new file mode 100644
+index 0000000..9b5686d
+--- /dev/null
++++ b/src/kanji-worker.js
+@@ -0,0 +1,50 @@
++// Dictionary decompression, tokenization and reading alignment stay off the UI thread.
++const kuromoji = require('../vendor/japanese/kuromoji.js');
++const { analyzeText } = require('./kanji-engine.cjs');
++let dictionarySequence = 0;
++const dictionaryRequests = new Map();
++globalThis.__FURIGANA_DICT_LOADER__ = path => new Promise((resolve, reject) => {
++    const id = ++dictionarySequence;
++    dictionaryRequests.set(id, { resolve, reject });
++    self.postMessage({ type: 'dictionary', id, name: path.split('/').pop() });
++});
++let tokenizerPromise;
++const getTokenizer = () => tokenizerPromise ||= new Promise((resolve, reject) => {
++    kuromoji.builder({ dicPath: 'dict' }).build((error, tokenizer) => error ? reject(error) : resolve(tokenizer));
++});
++let latestRequest = 0;
++const cache = new Map();
++function analyzeCached(tokenizer, text, roman) {
++    const key = JSON.stringify([text, roman]);
++    if (cache.has(key)) return cache.get(key);
++    const result = analyzeText(tokenizer, text, roman);
++    if (cache.size >= 600) cache.delete(cache.keys().next().value);
++    cache.set(key, result);
++    return result;
++}
++self.onmessage = async ({ data }) => {
++    if (data.type === 'dictionary') {
++        const request = dictionaryRequests.get(data.id);
++        dictionaryRequests.delete(data.id);
++        if (request) data.error ? request.reject(new Error(data.error)) : request.resolve(data.buffer);
++        return;
++    }
++    if (data.type !== 'analyze') return;
++    latestRequest = data.id;
++    try {
++        const tokenizer = await getTokenizer();
++        const result = [];
++        for (const line of data.lines) {
++            if (data.id !== latestRequest) return;
++            result.push(line ? {
++                original: analyzeCached(tokenizer, line.text, line.roman),
++                karaoke: analyzeCached(tokenizer, line.karaoke, line.roman),
++            } : null);
++            // Accept newer song requests between lines.
++            await new Promise(resolve => setTimeout(resolve, 0));
++        }
++        self.postMessage({ type: 'result', id: data.id, result });
++    } catch (error) {
++        self.postMessage({ type: 'result', id: data.id, error: String(error.message || error) });
++    }
++};
+diff --git a/src/lyric-provider.js b/src/lyric-provider.js
+index 5fdadb8..c7eb9f4 100644
+--- a/src/lyric-provider.js
++++ b/src/lyric-provider.js
+@@ -2,7 +2,8 @@
+ // Also expose window.currentLyrics for other modules.
+ 
+ import { parseLyric } from './liblyric/index.ts';
+-import { cyrb53 } from './utils.js';
++import { cyrb53, getSetting } from './utils.js';
++import { addKanjiReadings, cancelKanjiReadings, disposeKanjiReader } from './kanji-reader.js';
+ import { appendRegisterCall, fetchLyricsBySongId, getPlayingSongId } from './ncm-compat.js';
+ 
+ const preProcessLyrics = (lyrics) => {
+@@ -141,6 +142,21 @@ let lyricFetchAbortController = null;
+ let lastFetchedSongId = '';
+ let refreshTimer = 0;
+ 
++const amendKanjiReadings = async (lyrics, token) => {
++	if (getSetting('kanji-reading-mode', 'romaji') === 'off') return;
++	const enriched = await addKanjiReadings(lyrics.lyrics);
++	if (!enriched || token !== currentLyricUpdateToken || window.currentLyrics !== lyrics) return;
++	window.currentLyrics = { ...lyrics, lyrics: enriched, amend: true };
++	document.dispatchEvent(new CustomEvent('lyrics-updated', { detail: window.currentLyrics }));
++};
++
++document.addEventListener('rnp-kanji-reading-mode', event => {
++	if (event.detail === 'off') disposeKanjiReader();
++	else if (window.currentLyrics && !window.currentLyrics.lyrics.some(line => line.kanjiReading)) {
++		amendKanjiReadings(window.currentLyrics, currentLyricUpdateToken);
++	}
++});
++
+ const emitProcessedLyrics = async (_rawLyrics, songID = '') => {
+ 	if (!_rawLyrics || _rawLyrics?.data === -400) {
+ 		return false;
+@@ -168,6 +184,7 @@ const emitProcessedLyrics = async (_rawLyrics, songID = '') => {
+ 	lastFetchedSongId = resolvedSongId;
+ 	const updateToken = Symbol('rnp-lyrics-update');
+ 	currentLyricUpdateToken = updateToken;
++	cancelKanjiReadings();
+ 
+ 	const preprocessedLyrics = preProcessLyrics(rawLyrics);
+ 	setTimeout(async () => {
+@@ -229,6 +246,7 @@ const emitProcessedLyrics = async (_rawLyrics, songID = '') => {
+ 		console.log('hash', window.currentLyrics.hash);
+ 		console.groupEnd();
+ 		document.dispatchEvent(new CustomEvent('lyrics-updated', { detail: window.currentLyrics }));
++		amendKanjiReadings(lyrics, updateToken);
+ 	}, 0);
+ 
+ 	return true;
+diff --git a/src/lyrics.js b/src/lyrics.js
+index 8ae8062..08a98fc 100644
+--- a/src/lyrics.js
++++ b/src/lyrics.js
+@@ -4,6 +4,8 @@ import { showContextMenu } from './context-menu';
+ import { appendRegisterCall, getIsPlayingFromPlayStateEvent, getPlayerButton, isPlayerPlaying, removeRegisterCall } from './ncm-compat.js';
+ import { useRnpLyricPageOpen } from './rnp-page-state.js';
+ import './lyrics.scss';
++import { KanjiText, KanjiKaraoke } from './kanji-ruby.js';
++import { hasReadings, useKanjiReading } from './kanji-model.cjs';
+ 
+ const useState = React.useState;
+ const useEffect = React.useEffect;
+@@ -34,7 +36,9 @@ const estimateLyricLineHeight = (line, options) => {
+ 		? fontSize * (options.karaokeAnimation === 'slide' ? 1.5 : 1.2)
+ 		: baseLineHeight;
+ 	const gap = fontSize * 0.3;
+-	if (options.showRomaji && line.romanLyric) {
++	const kanjiReading = useKanjiReading(line, options.kanjiReadingMode, options.showRomaji);
++	if (kanjiReading && hasReadings(line)) height += fontSize * 0.6;
++	if (options.showRomaji && line.romanLyric && !kanjiReading) {
+ 		height += gap + fontSize * 0.72;
+ 	}
+ 	if (options.showTranslation && line.translatedLyric) {
+@@ -112,6 +116,12 @@ export function Lyrics(props) {
+ 	const [RotateCurvature, setRotateCurvature] = useState(getSetting('lyric-rotate-curvature', 30));
+ 	const [showTranslation, setShowTranslation] = useState(getSetting('show-translation', true));
+ 	const [showRomaji, setShowRomaji] = useState(getSetting('show-romaji', true));
++	const [kanjiReadingMode, setKanjiReadingMode] = useState(getSetting('kanji-reading-mode', 'romaji'));
++	useEffect(() => {
++		const onMode = event => { setKanjiReadingMode(event.detail); setRecalcCounter(Date.now()); };
++		document.addEventListener('rnp-kanji-reading-mode', onMode);
++		return () => document.removeEventListener('rnp-kanji-reading-mode', onMode);
++	}, []);
+ 	const [useKaraokeLyrics, setUseKaraokeLyrics] = useState(getSetting('use-karaoke-lyrics', true));
+ 	const [karaokeAnimation, setKaraokeAnimation] = useState(getSetting('karaoke-animation', 'float'));
+ 	const [currentLyricAlignmentPercentage, setCurrentLyricAlignmentPercentage] = useState(parseInt(getSetting('current-lyric-alignment-percentage', 50)));
+@@ -201,7 +211,7 @@ export function Lyrics(props) {
+ 		}
+ 		setLyrics(e.detail.lyrics);
+ 		setHasTranslation(e.detail.lyrics.some((x) => x.translatedLyric));
+-		setHasRomaji(e.detail.lyrics.some((x) => x.romanLyric));
++		setHasRomaji(e.detail.lyrics.some((x) => x.romanLyric || hasReadings(x)));
+ 		setHasKaraoke(e.detail.lyrics.some((x) => x.dynamicLyric));
+ 		setIsUnsynced(e.detail?.unsynced ?? false);
+ 
+@@ -220,7 +230,7 @@ export function Lyrics(props) {
+ 			preProcessMapping(currentLyrics);
+ 			setLyrics(currentLyrics);
+ 			setHasTranslation(currentLyrics.some((x) => x.translatedLyric));
+-			setHasRomaji(currentLyrics.some((x) => x.romanLyric));
++			setHasRomaji(currentLyrics.some((x) => x.romanLyric || hasReadings(x)));
+ 			setHasKaraoke(currentLyrics.some((x) => x.dynamicLyric));
+ 			setIsUnsynced(currentLyrics?.unsynced ?? false);
+ 
+@@ -798,8 +808,9 @@ export function Lyrics(props) {
+ 							currentLine={currentLine}
+ 							transforms={transforms}
+ 							outOfRangeScrolling={outOfRangeScrolling}
+-							height={estimateLyricLineHeight(line, {
+-								fontSize,
++								height={estimateLyricLineHeight(line, {
++									fontSize,
++									kanjiReadingMode,
+ 								showTranslation,
+ 								showRomaji,
+ 								useKaraokeLyrics,
+@@ -818,6 +829,7 @@ export function Lyrics(props) {
+ 						playState={playState && pageOpen}
+ 						showTranslation={showTranslation}
+ 						showRomaji={showRomaji}
++						kanjiReadingMode={kanjiReadingMode}
+ 						useKaraokeLyrics={useKaraokeLyrics}
+ 						jumpToTime={isPureMusic ? () => {} : jumpToTime}
+ 						transforms={transforms}
+@@ -939,6 +951,7 @@ export function Lyrics(props) {
+ 					lyrics={lyrics}
+ 					currentLine={currentLine}
+ 					showRomaji={showRomaji}
++					kanjiReadingMode={kanjiReadingMode}
+ 					showTranslation={showTranslation}
+ 					jumpToTime={jumpToTime}
+ 					isUnsynced={isUnsynced}
+@@ -994,6 +1007,8 @@ function Line(props) {
+ 	}
+ 	const karaokeLineBaseTime = props.line.dynamicLyricTime ?? props.line.time ?? 0;
+ 	const karaokeLineRef = useRef(null);
++	const kanjiReading = useKanjiReading(props.line, props.kanjiReadingMode, props.showRomaji);
++	const readingMode = kanjiReading ? props.kanjiReadingMode : 'off';
+ 	const getDisplayedCurrentTime = useCallback(() => {
+ 		return props.getCurrentTime ? props.getCurrentTime() : props.currentTime;
+ 	}, [props.getCurrentTime, props.currentTime]);
+@@ -1116,8 +1131,7 @@ function Line(props) {
+ 		}
+ 		if (trailingIndexes.length == 0) return;
+ 
+-		const glowAnimation = (index) => {
+-			if (!karaokeLineRef.current?.children[index]) return null;
++		const glowAnimation = (index, glowTarget) => {
+ 			const fadeIn = props.line.dynamicLyric[index].duration * 0.6;
+ 			const keep = props.line.dynamicLyric[index].duration * 0.4;
+ 			const fadeAway = 500;
+@@ -1131,7 +1145,6 @@ function Line(props) {
+ 				wordDuration: props.line.dynamicLyric[index].duration
+ 			};
+ 
+-			const glowTarget = karaokeLineRef.current?.children[index];
+ 			const glowAnimation = glowTarget.animate([
+ 				{filter: 'drop-shadow(0 0 0px rgba(var(--rnp-accent-color-shade-2-rgb), 0)) drop-shadow(0 0 0px rgba(var(--rnp-accent-color-shade-2-rgb), 0))'},
+ 				{filter: 'drop-shadow(0 0 15px rgba(var(--rnp-accent-color-shade-2-rgb), 1)) drop-shadow(0 0 10px rgba(var(--rnp-accent-color-shade-2-rgb), 0.5))', offset: fadeIn / duration},
+@@ -1152,8 +1165,10 @@ function Line(props) {
+ 
+ 		glowAnimationsRef.current = [];
+ 		for (let i = 0; i < trailingIndexes.length; i++) {
+-			const tmp = glowAnimation(trailingIndexes[i]);
+-			if (tmp) glowAnimationsRef.current.push(tmp);
++			const index = trailingIndexes[i];
++			for (const target of karaokeLineRef.current?.querySelectorAll(`[data-word-index="${index}"]`) || []) {
++				glowAnimationsRef.current.push(glowAnimation(index, target));
++			}
+ 		}
+ 
+ 		return () => {
+@@ -1162,7 +1177,7 @@ function Line(props) {
+ 			}
+ 			glowAnimationsRef.current = [];
+ 		};
+-	}, [props.line, props.useKaraokeLyrics, props.outOfRangeKaraoke, props.karaokeAnimation, props.lyricGlow, props.pageOpen]);
++	}, [props.line, props.useKaraokeLyrics, props.outOfRangeKaraoke, props.karaokeAnimation, props.lyricGlow, props.pageOpen, readingMode]);
+ 
+ 	// update glow animation
+ 	useEffect(() => {
+@@ -1266,24 +1281,14 @@ function Line(props) {
+ 				opacity: props.transforms?.opacity ?? 1,
+ 				...props.transforms?.outOfRangeHidden && {visibility: 'hidden'}
+ 			}}>
+-			{ props.line.dynamicLyric && props.useKaraokeLyrics && !props.outOfRangeKaraoke && <div className="rnp-lyrics-line-karaoke" ref={karaokeLineRef}>
+-				{props.line.dynamicLyric.map((word, index) => {
+-					return <div
+-						key={`${props.karaokeAnimation} ${index}`}
+-						ref={karaokeLineRef.current?.children[index]}
+-						className={`rnp-karaoke-word ${word?.isCJK ? 'is-cjk' : ''} ${word?.endsWithSpace ? 'end-with-space' : ''}`}
+-						style={getKaraokeAnimation(word)}>
+-							<span>{word.word}</span>
+-							{
+-								props.karaokeAnimation == 'slide' && <span className="rnp-karaoke-word-filler" style={getKaraokeFillerAnimation(word)}>{word.word}</span>
+-							}
+-					</div>
+-				})}
++			{ props.line.dynamicLyric && props.useKaraokeLyrics && !props.outOfRangeKaraoke && <div className={`rnp-lyrics-line-karaoke ${kanjiReading ? 'rnp-has-kanji-reading' : ''}`} ref={karaokeLineRef}>
++				<KanjiKaraoke words={props.line.dynamicLyric} segments={props.line.kanjiReading?.karaoke} mode={readingMode}
++					animation={props.karaokeAnimation} wordStyle={getKaraokeAnimation} fillerStyle={getKaraokeFillerAnimation} />
+ 			</div> }
+ 			{ !(props.line.dynamicLyric && props.useKaraokeLyrics && !props.outOfRangeKaraoke) && props.line.originalLyric && <div className="rnp-lyrics-line-original">
+-				{ props.line.originalLyric }
++				<KanjiText text={props.line.originalLyric} segments={props.line.kanjiReading?.original} mode={readingMode} />
+ 			</div> }
+-			{ props.line.romanLyric && props.showRomaji && <div className="rnp-lyrics-line-romaji">
++			{ props.line.romanLyric && props.showRomaji && !kanjiReading && <div className="rnp-lyrics-line-romaji">
+ 				{ props.line.romanLyric }
+ 			</div> }
+ 			{ props.line.translatedLyric && props.showTranslation && <div className="rnp-lyrics-line-translated">
+@@ -1600,8 +1605,8 @@ function LyricOverview(props) {
+ 							props.jumpToTime(line.time + 50);
+ 							props.exitOverviewModeScrollingSoon(0);
+ 						}}>
+-							{ !line.isInterlude && <div className="rnp-lyrics-overview-line-original">{line.originalLyric}</div> }
+-							{ line.romanLyric && props.showRomaji && <div className="rnp-lyrics-overview-line-romaji">{line.romanLyric}</div> }
++							{ !line.isInterlude && <div className="rnp-lyrics-overview-line-original"><KanjiText text={line.originalLyric} segments={line.kanjiReading?.original} mode={useKanjiReading(line, props.kanjiReadingMode, props.showRomaji) ? props.kanjiReadingMode : 'off'} /></div> }
++							{ line.romanLyric && props.showRomaji && !useKanjiReading(line, props.kanjiReadingMode, props.showRomaji) && <div className="rnp-lyrics-overview-line-romaji">{line.romanLyric}</div> }
+ 							{ line.translatedLyric && props.showTranslation && <div className="rnp-lyrics-overview-line-translation">{line.translatedLyric}</div> }
+ 					</div>
+ 				})}
+diff --git a/src/lyrics.scss b/src/lyrics.scss
+index fdcb892..1e3a685 100644
+--- a/src/lyrics.scss
++++ b/src/lyrics.scss
+@@ -209,6 +209,30 @@ body.original-lyric-bold {
+ }
+ 
+ 
++.rnp-lyrics .rnp-kanji-ruby {
++	display: inline-flex;
++	flex-direction: column-reverse;
++	vertical-align: bottom;
++	align-items: center;
++	text-indent: 0;
++	margin: 0 0.025em;
++	.rnp-kanji-base { display: inline-block; white-space: nowrap; }
++	rt {
++		display: block;
++		font-size: 0.43em;
++		line-height: 1.3;
++		font-weight: 500;
++		letter-spacing: 0;
++		white-space: nowrap;
++		user-select: none;
++		opacity: 0.85;
++	}
++}
++body.rnp-karaoke-animation-slide .rnp-lyrics-line .rnp-lyrics-line-karaoke.rnp-has-kanji-reading {
++	display: block;
++}
++.rnp-lyrics .rnp-karaoke-word { position: relative; }
++
+ body.rnp-karaoke-animation-float .rnp-lyrics-line {
+ 	.rnp-karaoke-word {
+ 		will-change: opacity, transform;
+diff --git a/src/main.js b/src/main.js
+index 28eff82..456d667 100644
+--- a/src/main.js
++++ b/src/main.js
+@@ -2773,6 +2773,9 @@ const addSettingsMenu = async () => {
+ 		});
+ 
+ 		// 歌词
++		bindSelectGroupToClasses(getOptionDom('#kanji-reading-mode'), 'romaji', x => `rnp-kanji-reading-${x}`, x => {
++			document.dispatchEvent(new CustomEvent('rnp-kanji-reading-mode', { detail: x }));
++		});
+ 		const originalLyricBold = getOptionDom('#original-lyric-bold');
+ 		const lyricFontSize = getOptionDom('#lyric-font-size');
+ 		const lyricRomajiSizeEm = getOptionDom('#lyric-romaji-size-em');
+diff --git a/src/manifest.json b/src/manifest.json
+index ba8bf64..c375602 100644
+--- a/src/manifest.json
++++ b/src/manifest.json
+@@ -5,7 +5,7 @@
+   "author_links": [ "https://github.com/SUlTlUS" ],
+   "description": "重新设计的正在播放页面和歌词适配全新网易云音乐",
+   "preview": "preview.webp",
+-  "version": "3.0.2",
++  "version": "3.0.2+romaji.1",
+   "type": "extension",
+   "requirements": [],
+   "loadAfter": [ "MaterialYouTheme", "LibFrontendPlay", "SimpleAudioVisualizer" ],
+diff --git a/src/settings-menu.html b/src/settings-menu.html
+index e5fa94c..bd29919 100644
+--- a/src/settings-menu.html
++++ b/src/settings-menu.html
+@@ -152,6 +152,15 @@
+ 		
+ 		<div class="rnp-group" data-tab="lyric">
+ 			<div class="rnp-group-title">歌词</div>
++			<div class="rnp-select-group-wrapper">
++				<label for="kanji-reading-mode" class="rnp-select-group-label">日语汉字上方注音</label>
++				<div class="rnp-select-group" id="kanji-reading-mode">
++					<button class="rnp-select-group-btn selected" value="romaji">罗马音</button>
++					<button class="rnp-select-group-btn" value="hiragana">平假名</button>
++					<button class="rnp-select-group-btn" value="off">关闭</button>
++				</div>
++			</div>
++			<span class="rnp-checkbox-note">仅标注日语汉字，如 世界 → sekai。优先使用歌曲读音，缺失时用本地词典补全；特殊唱法可能有误。首次加载稍等数秒。“音”按钮控制显示；关闭上方注音可恢复原来的整行罗马音。</span>
+ 			<div class="rnp-checkbox-wrapper original-lyric-bold">
+ 				<input id="original-lyric-bold" type="checkbox" class="rnp-checkbox">
+ 				<label for="original-lyric-bold" class="rnp-checkbox-label">加粗首行</label>
+diff --git a/tools/test-kanji.cjs b/tools/test-kanji.cjs
+new file mode 100644
+index 0000000..24527bf
+--- /dev/null
++++ b/tools/test-kanji.cjs
+@@ -0,0 +1,74 @@
++const assert = require('node:assert/strict');
++const { test, before } = require('node:test');
++const fs = require('node:fs/promises');
++const path = require('node:path');
++const { Worker } = require('node:worker_threads');
++const { analyzeText } = require('../src/kanji-engine.cjs');
++const { onlyKanji, readingRequests, karaokeGroups, useKanjiReading } = require('../src/kanji-model.cjs');
++
++let tokenizer;
++before(async () => {
++    globalThis.__FURIGANA_DICT_LOADER__ = async file => {
++        const data = await fs.readFile(file);
++        return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
++    };
++    tokenizer = await new Promise((resolve, reject) => require('../vendor/japanese/kuromoji.js').builder({ dicPath: path.join(__dirname, '../vendor/japanese/dict') }).build((error, result) => error ? reject(error) : resolve(result)));
++});
++test('offline readings preserve every character and annotate only kanji', () => {
++    for (const text of ['世界に行こう', '持ち帰る', '愛がゆえに', '食べる', 'こんにちは', 'Hello 世界！', '1人で行く', '10年後に会う', '宇宙（そら）へ行く', '𠮷野へ行く']) {
++        const segments = analyzeText(tokenizer, text);
++        assert.equal(segments.map(segment => segment.text).join(''), text);
++        assert.ok(segments.every(segment => !segment.romaji || onlyKanji(segment.text)));
++    }
++    assert.equal(analyzeText(tokenizer, '世界に行こう').find(s => s.text === '世界').romaji, 'sekai');
++    const split = analyzeText(tokenizer, '持ち帰る');
++    assert.equal(split.find(s => s.text === '持').romaji, 'mo');
++    assert.equal(split.find(s => s.text === '帰').romaji, 'kae');
++    assert.equal(analyzeText(tokenizer, '愛がゆえに')[0].romaji, 'ai');
++});
++test('official singing readings take precedence, malformed readings fall back', () => {
++    assert.equal(analyzeText(tokenizer, '宇宙へ', 'so ra e')[0].romaji, 'sora');
++    assert.equal(analyzeText(tokenizer, '世界へ', 'invalid!!!')[0].romaji, 'sekai');
++    assert.equal(analyzeText(tokenizer, '宇宙（そら）へ')[0].romaji, 'sora');
++});
++test('Chinese translations and non-Japanese songs do not enter the engine', () => {
++    const chinese = [{ originalLyric: '这是我们的世界', translatedLyric: '世界に行こう' }, { originalLyric: '你好世界' }];
++    assert.deepEqual(readingRequests(chinese), [null, null]);
++    const lines = [{ originalLyric: '世界へ' }, { originalLyric: 'あなたに' }, { originalLyric: '未来' }, { originalLyric: '作詞：誰か' }];
++    assert.deepEqual(readingRequests(lines).map(Boolean), [true, true, true, false]);
++    assert.equal(useKanjiReading({ kanjiReading: {} }, 'off', true), false);
++    assert.equal(useKanjiReading({ kanjiReading: {} }, 'romaji', false), false);
++});
++test('compound ruby crosses YRC word boundaries without changing timing indices', () => {
++    const words = [{ word: '世', time: 100 }, { word: '界へ行', time: 200 }, { word: 'く', time: 300 }];
++    const groups = karaokeGroups(words, analyzeText(tokenizer, words.map(w => w.word).join('')));
++    const world = groups.find(group => group.romaji === 'sekai');
++    assert.deepEqual(world.parts.map(part => [part.text, part.index]), [['世', 0], ['界', 1]]);
++    assert.equal(groups.flatMap(group => group.parts).map(part => part.text).join(''), '世界へ行く');
++    assert.deepEqual(groups.flatMap(group => group.parts).filter(part => part.final).map(part => part.index), [0, 1, 2]);
++    assert.equal(karaokeGroups(words, [{ text: 'different', romaji: 'wrong' }]).length, words.length);
++});
++test('production worker loads local dictionaries and ignores stale song requests', async () => {
++    const worker = new Worker(`const {parentPort}=require('node:worker_threads'); global.self=globalThis; global.postMessage=(data)=>parentPort.postMessage(data); parentPort.on('message', data=>self.onmessage({data})); require(${JSON.stringify(path.join(__dirname, '../dist/kanji-worker.js'))});`, { eval: true });
++    try {
++        const messages = [];
++        const response = new Promise((resolve, reject) => {
++            worker.on('error', reject);
++            worker.on('message', async data => {
++                if (data.type === 'dictionary') {
++                    const bytes = await fs.readFile(path.join(__dirname, '../vendor/japanese/dict', data.name));
++                    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
++                    worker.postMessage({ type: 'dictionary', id: data.id, buffer }, [buffer]);
++                } else { messages.push(data); resolve(data); }
++            });
++        });
++        worker.postMessage({ type: 'analyze', id: 1, lines: [{ text: '古い歌へ', karaoke: '古い歌へ', roman: '' }] });
++        worker.postMessage({ type: 'analyze', id: 2, lines: [{ text: '世界へ', karaoke: '世界へ', roman: '' }, null] });
++        const result = await response;
++        assert.equal(result.id, 2);
++        assert.equal(result.error, undefined);
++        assert.equal(result.result[0].original[0].romaji, 'sekai');
++        assert.equal(result.result[1], null);
++        assert.equal(messages.length, 1);
++    } finally { await worker.terminate(); }
++});
+diff --git a/webpack.config.js b/webpack.config.js
+index 542ed4f..db57d4b 100644
+--- a/webpack.config.js
++++ b/webpack.config.js
+@@ -27,6 +27,15 @@ const config = {
+   plugins: [
+     new copyWebpackPlugin({
+         patterns: [
++            { from: 'src/kanji-host.html', to: 'kanji-host.html' },
++            { from: 'src/kanji-host.js', to: 'kanji-host.js' },
++            { from: 'LICENSE', to: 'licenses/RefinedNowPlayingNext-MIT.txt' },
++            { from: 'vendor/japanese/dict', to: 'dict' },
++            { from: 'vendor/japanese/NOTICE.md', to: 'licenses/japanese-NOTICE.md' },
++            { from: 'vendor/japanese/LICENSE', to: 'licenses/jp-furigana-MIT.txt' },
++            { from: 'vendor/japanese/LICENSE-kuromoji.txt', to: 'licenses/kuromoji-Apache-2.0.txt' },
++            { from: 'node_modules/wanakana/LICENSE', to: 'licenses/wanakana-MIT.txt' },
++            { from: 'THIRD-PARTY-NOTICES.md', to: 'licenses/THIRD-PARTY-NOTICES.md' },
+             {
+               from: path.resolve(__dirname, "src", "manifest.json"),
+               to: path.resolve(__dirname, "dist", "manifest.json"),
+@@ -107,5 +116,12 @@ module.exports = () => {
+   }
+   
+   
+-  return config;
++  return [config, {
++    name: 'kanji-worker',
++    mode: config.mode,
++    target: ['webworker', 'es2020'],
++    entry: './src/kanji-worker.js',
++    output: { path: path.resolve(__dirname, 'dist'), filename: 'kanji-worker.js' },
++    optimization: config.optimization,
++  }];
+ };
