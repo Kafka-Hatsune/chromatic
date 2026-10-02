@@ -6,3 +6,5 @@ dist
 .lldb_cmds
 output.log
 /test
+.local-install/
+tools/cloudmusic/backups/
